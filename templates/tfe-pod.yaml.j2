@@ -1,0 +1,100 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tfe
+  labels:
+    app: tfe
+spec:
+{% if tfe_hairpin_addressing %}
+  hostAliases:
+    - ip: {{ vm_private_ip }}
+      hostnames:
+        - "{{ tfe_hostname }}"
+{% endif %}
+  # RHEL 8 specific security context
+  securityContext:
+    seLinuxOptions:
+      type: container_t
+      level: "s0:c123,c456"
+    fsGroup: 0
+    runAsUser: 0
+    runAsGroup: 0
+
+  containers:
+    - name: terraform-enterprise
+      image: {{ tfe_image_repository_url }}/{{ tfe_image_name }}:{{ tfe_image_tag }}
+      
+      env:
+        # Application settings
+        - name: TFE_HOSTNAME
+          value: "{{ tfe_hostname }}"
+        - name: TFE_LICENSE
+          value: "{{ tfe_license }}"
+        - name: TFE_LICENSE_PATH
+          value: ""
+        - name: TFE_OPERATIONAL_MODE
+          value: "{{ tfe_operational_mode }}"
+        - name: TFE_ENCRYPTION_PASSWORD
+          value: "{{ tfe_encryption_password }}"
+        - name: TFE_CAPACITY_CONCURRENCY
+          value: "{{ tfe_capacity_concurrency }}"
+        - name: TFE_CAPACITY_CPU
+          value: "{{ tfe_capacity_cpu }}"
+        - name: TFE_CAPACITY_MEMORY
+          value: "{{ tfe_capacity_memory }}"
+        
+        # Database settings
+        - name: TFE_DATABASE_HOST
+          value: "{{ tfe_database_host }}"
+        - name: TFE_DATABASE_NAME
+          value: "{{ tfe_database_name }}"
+        - name: TFE_DATABASE_USER
+          value: "{{ tfe_database_user }}"
+        - name: TFE_DATABASE_PASSWORD
+          value: "{{ tfe_database_password }}"
+        - name: TFE_DATABASE_PARAMETERS
+          value: "{{ tfe_database_parameters }}"
+        
+        # Object storage settings
+        - name: TFE_OBJECT_STORAGE_TYPE
+          value: "{{ tfe_object_storage_type }}"
+        - name: TFE_OBJECT_STORAGE_AZURE_ACCOUNT_NAME
+          value: "{{ tfe_object_storage_azure_account_name }}"
+        - name: TFE_OBJECT_STORAGE_AZURE_CONTAINER
+          value: "{{ tfe_object_storage_azure_container }}"
+        - name: TFE_OBJECT_STORAGE_AZURE_ENDPOINT
+          value: "{{ tfe_object_storage_azure_endpoint }}"
+        - name: TFE_OBJECT_STORAGE_AZURE_USE_MSI
+          value: "{{ tfe_object_storage_azure_use_msi }}"
+{% if tfe_object_storage_azure_use_msi %}
+        - name: TFE_OBJECT_STORAGE_AZURE_CLIENT_ID
+          value: "{{ tfe_object_storage_azure_client_id }}"
+{% else %}
+        - name: TFE_OBJECT_STORAGE_AZURE_ACCOUNT_KEY
+          value: "{{ tfe_object_storage_azure_account_key }}"
+{% endif %}
+
+{% if tfe_operational_mode == "active-active" %}
+        # Redis settings
+        - name: TFE_REDIS_HOST
+          value: "{{ tfe_redis_host }}"
+        - name: TFE_REDIS_USE_TLS
+          value: "{{ tfe_redis_use_tls }}"
+        - name: TFE_REDIS_USE_AUTH
+          value: "{{ tfe_redis_use_auth }}"
+        - name: TFE_REDIS_PASSWORD
+          value: "{{ tfe_redis_password }}"
+
+        # Vault settings
+        - name: TFE_VAULT_CLUSTER_ADDRESS
+          value: "https://{{ vm_private_ip }}:8201"
+{% endif %}
+
+        # TLS settings
+        - name: TFE_TLS_CERT_FILE
+          value: "{{ tfe_tls_cert_file }}"
+        - name: TFE_TLS_KEY_FILE
+          value: "{{ tfe_tls_key_file }}"
+        - name: TFE_TLS_CA_BUNDLE_FILE
+          value: "
