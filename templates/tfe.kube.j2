@@ -1,0 +1,20 @@
+[Unit]
+Description=Terraform Enterprise Podman deployment
+Requires=podman.socket
+After=podman.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+Environment=PODMAN_SYSTEMD_UNIT=%n
+Restart=always
+TimeoutStopSec=70
+ExecStartPre=/bin/rm -f %t/%n.ctr-id
+ExecStart=/usr/bin/podman play kube /etc/containers/systemd/tfe-pod.yaml --replace
+ExecStop=/usr/bin/podman pod stop tfe
+ExecStopPost=/usr/bin/podman pod rm tfe -f
+SyslogIdentifier=tfe
+
+[Install]
+WantedBy=default.target
