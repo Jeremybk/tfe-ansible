@@ -1,0 +1,246 @@
+---
+# Main playbook for Terraform Enterprise deployment on RHEL 8 using Podman
+- name: Deploy Terraform Enterprise on RHEL 8 with Podman
+  hosts: tfe_nodes
+  become: true
+  
+  pre_tasks:
+    - name: Verify RHEL 8 operating system
+      ansible.builtin.fail:
+        msg: "This playbook only supports RHEL 8. Current OS: {{ ansible_distribution }} {{ ansible_distribution_major_version }}"
+      when: >
+        ansible_distribution != "RedHat" or 
+        ansible_distribution_major_version != "8"
+
+  vars:
+    tfe_config_dir: /etc/tfe
+    tfe_license_path: "{{ tfe_config_dir }}/tfe-license.hclic"
+    tfe_tls_certs_dir: "{{ tfe_config_dir }}/tls"
+    tfe_log_forwarding_config_path: "{{ tfe_config_dir }}/fluent-bit.conf"
+    vm_private_ip: "{{ ansible_default_ipv4.address }}"
+
+  tasks:
+    - name: Create TFE configuration directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0750'
+      loop:
+        - "{{ tfe_config_dir }}"
+        - "{{ tfe_tls_certs_dir }}"
+        - "/etc/containers/systemd"
+
+    # RHEL 8 storage configuration
+    - name: Configure RHEL 8 storage partitions
+      block:
+        - name: Resize root partition to 10G
+          ansible.builtin.lvol:
+            vg: rootvg
+            lv: rootlv
+            size: 10G
+            resizefs: true
+            force: true
+
+        - name: Resize var partition to 40G
+          ansible.builtin.lvol:
+            vg: rootvg
+            lv: varlv
+            size: 40G
+            resizefs: true
+            force: true
+
+    # Install Azure CLI
+    - name: Import Microsoft repository key
+      ansible.builtin.rpm_key:
+        key: https://packages.microsoft.com/keys/microsoft.asc
+        state: present
+
+    - name: Add Microsoft repository for Azure CLI
+      ansible.builtin.yum_repository:
+        name: azure-cli
+        description: Azure CLI
+        baseurl: https://packages.microsoft.com/config/rhel/8/packages-microsoft-prod.rpm
+        gpgcheck: yes
+        enabled: yes
+
+    - name: Install Azure CLI
+      ansible.builtin.dnf:
+        name: azure-cli
+        state: present
+        update_cache: yes
+
+    # Install and configure Podman
+    - name: Install Podman and dependencies
+      ansible.builtin.dnf:
+        name: 
+          - container-tools
+          - podman-docker  # Provides Docker compatibility layer
+        state: present
+
+    - name: Configure Podman system settings
+      ansible.builtin.copy:
+        dest: /etc/containers/containers.conf
+        content: |
+          [containers]
+          netns="host"
+          userns="host"
+          ipcns="host"
+          utsns="host"
+          cgroupns="host"
+          cgroups="enabled"
+          log_driver = "journald"
+          
+          [engine]
+          cgroup_manager = "systemd"
+          events_logger = "journald"
+          runtime = "crun"
+        mode: '0644'
+
+    - name: Enable and start Podman socket
+      ansible.builtin.systemd:
+        name: podman.socket
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    # Azure environment configuration
+    - name: Configure Azure environment for GovCloud
+      ansible.builtin.command: az cloud set --name AzureUSGovernment
+      when: is_govcloud_region | bool
+
+    - name: Login to Azure using managed identity
+      ansible.builtin.command: az login --identity
+      register: az_login
+      changed_when: az_login.rc == 0
+
+    # Retrieve and configure secrets
+    - name: Retrieve secrets from Key Vault
+      block:
+        - name: Get TFE license
+          ansible.builtin.command: >-
+            az keyvault secret show 
+            --id {{ tfe_license_keyvault_secret_id }} 
+            --query value --output tsv
+          register: tfe_license_result
+          no_log: true
+          changed_when: false
+
+        - name: Save TFE license file
+          ansible.builtin.copy:
+            content: "{{ tfe_license_result.stdout }}"
+            dest: "{{ tfe_license_path }}"
+            mode: '0600'
+          no_log: true
+
+        - name: Get TLS certificates
+          ansible.builtin.command: >-
+            az keyvault secret show 
+            --id {{ item.id }}
+            --query value --output tsv
+          register: cert_results
+          loop:
+            - { id: "{{ tfe_tls_cert_keyvault_secret_id }}", file: "cert.pem" }
+            - { id: "{{ tfe_tls_privkey_keyvault_secret_id }}", file: "key.pem" }
+            - { id: "{{ tfe_tls_ca_bundle_keyvault_secret_id }}", file: "bundle.pem" }
+          no_log: true
+          changed_when: false
+
+        - name: Save TLS certificates
+          ansible.builtin.copy:
+            content: "{{ item.stdout | b64decode }}"
+            dest: "{{ tfe_tls_certs_dir }}/{{ item.item.file }}"
+            mode: '0600'
+          loop: "{{ cert_results.results }}"
+          loop_control:
+            label: "{{ item.item.file }}"
+          no_log: true
+
+        - name: Get encryption password
+          ansible.builtin.command: >-
+            az keyvault secret show 
+            --id {{ tfe_encryption_password_keyvault_secret_id }}
+            --query value
+          register: encryption_password
+          no_log: true
+          changed_when: false
+
+    # Configure log forwarding
+    - name: Configure log forwarding
+      ansible.builtin.template:
+        src: fluent-bit.conf.j2
+        dest: "{{ tfe_log_forwarding_config_path }}"
+        mode: '0640'
+      when: tfe_log_forwarding_enabled | bool
+
+    # Deploy TFE with Podman
+    - name: Deploy TFE containers
+      block:
+        - name: Create Podman pod configuration
+          ansible.builtin.template:
+            src: tfe-pod.yaml.j2
+            dest: "{{ tfe_config_dir }}/tfe-pod.yaml"
+            mode: '0640'
+          vars:
+            tfe_license: "{{ tfe_license_result.stdout }}"
+            tfe_encryption_password: "{{ encryption_password.stdout }}"
+
+        - name: Configure container registry authentication
+          ansible.builtin.command: >-
+            podman login {{ tfe_image_repository_url }}
+            --username {{ tfe_image_repository_username }}
+            --password {{ tfe_license_result.stdout if tfe_image_repository_url == 'images.releases.hashicorp.com' else tfe_image_repository_password }}
+          no_log: true
+
+        - name: Pull TFE image
+          ansible.builtin.command: >-
+            podman pull {{ tfe_image_repository_url }}/{{ tfe_image_name }}:{{ tfe_image_tag }}
+
+        # RHEL 8 specific SELinux configurations
+        - name: Configure SELinux for containers
+          ansible.builtin.seboolean:
+            name: "{{ item }}"
+            state: yes
+            persistent: yes
+          loop:
+            - container_manage_cgroup
+            - container_use_devices
+            - container_use_hostpath
+
+        - name: Configure Podman systemd service
+          ansible.builtin.template:
+            src: tfe.kube.j2
+            dest: /etc/containers/systemd/tfe.kube
+            mode: '0644'
+
+        - name: Copy pod configuration to systemd directory
+          ansible.builtin.copy:
+            src: "{{ tfe_config_dir }}/tfe-pod.yaml"
+            dest: /etc/containers/systemd/
+            remote_src: true
+
+        - name: Create Podman persistent volume
+          ansible.builtin.command: >-
+            podman volume create terraform-enterprise-cache
+          args:
+            creates: /var/lib/containers/storage/volumes/terraform-enterprise-cache
+
+        - name: Start TFE service
+          ansible.builtin.systemd:
+            name: tfe
+            state: started
+            daemon_reload: true
+
+    # Health checks and verification
+    - name: Wait for TFE initialization
+      ansible.builtin.pause:
+        seconds: 60
+
+    - name: Wait for TFE health check
+      ansible.builtin.uri:
+        url: "https://{{ vm_private_ip }}/_health_check"
+        validate_certs: false
+        method: GET
+      register: health_result
+      until: health_result.status == 200
+      retries: 60
+      delay: 5
